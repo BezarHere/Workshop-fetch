@@ -1,19 +1,30 @@
 import glassy.utils
 import os
 import re
+import shutil
 import subprocess
-import whichcraft
+import sys
+from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from json.decoder import JSONDecoder
 from json.encoder import JSONEncoder
 from zipfile import ZipFile
+import termcolor, colorama
+
+colorama.init()
 
 import requests
 
 __version__ = '1.0.0'
 
+termcolor.cprint("hello", 'red')
 
 running: bool = False
+
+download_output_folder = Path('downloads')
+
+download_output_folder.mkdir(exist_ok=True)
 
 login: str | None = None
 passw: str | None = None
@@ -32,8 +43,43 @@ path_sep_regex = re.compile(r'[\\/]')
 
 confirmation_overrides: dict[str, bool] = {}
 
+_html_workshop_page_ids_extractor_re = re.compile(r"(ShowAddToCollection|SubscribeCollectionItem)[( ']+(\d+)[ ',]+(\d+)")
+
+@cache
+def html_appname_extractor_re(appid: int):
+	return re.compile(rf'\s*href\s*=\s*"https://steamcommunity.com/app/{appid}"\s*>(.+?)<\s*/\s*a\s*>\s*')
+@cache
+def html_item_name_extractor_re():
+	return re.compile(rf'\s*class\s*=\s*"workshopItemTitle"\s*>(.+?)<\s*/\s*div\s*>\s*')
+
+@cache
+def get_appname_from_html(appid: int | str, html: str):
+	return html_appname_extractor_re(str(appid)).search(html)[1]
+@cache
+def get_item_name_from_html(html: str):
+	return html_item_name_extractor_re().search(html)[1]
+
+def get_steamcmd_content_folder():
+	return steampath.joinpath("steamapps\workshop\content")
+
+class DownloadLock:
+	def __enter__(self):
+		global running
+		running = True
+	
+	def __exit__(self, *exc):
+		global running
+		running = False
+
+@dataclass(slots=True, frozen=True)
+class WorkshopItemInfo:
+	appname: str
+	name: str
+	appid: int
+	itemid: int
+
 def get_credits() -> str:
-	text = ["Made by BezarHere"]
+	text = ["Made by BezarHere (Zaher .A Babker)"]
 	return '\n'.join(text)
 
 __folder__ = Path(__file__).parent
@@ -46,6 +92,16 @@ def to_local_path(path: str | Path):
 
 def push_text(text):
 	print('  ', str(text).replace('\n', '\n  '), sep='')
+
+def header(text: str, border_pattren: str = '###', margin: int = 6):
+	border_len = len(border_pattren)
+	textbox_width = len(text) + margin
+	border_tiling_count = (textbox_width // border_len) + 1
+	text_padding = ' ' * (((border_tiling_count * border_len) - textbox_width) // 2 + (margin // 2))
+	push_text(border_pattren * border_tiling_count)
+	push_text(text_padding + text + text_padding)
+	push_text(border_pattren * border_tiling_count)
+
 
 def request_confirmation(text: str, conf_id: str):
 	if conf_id in confirmation_overrides:
@@ -74,35 +130,31 @@ def download_chunks(url: str, download_path: Path | str, chunk_size: int = 8192,
 				
 	return download_path
 
-# faster download when mixing games
-# TODO
+def get_app_and_item_ids(url: str):
+	try:
+		x = requests.get(url).text
+	except Exception as exc:
+		push_text("Could not load workshop page for '" + url + "'\n")
+		push_text(str(type(exc)) + "\n")
+		push_text(str(exc) + "\n")
+	else:
+		if _html_workshop_page_ids_extractor_re.search(x):
+			# collection
+			dls = _html_workshop_page_ids_extractor_re.finditer(x)
+			for i in dls:
+				yield WorkshopItemInfo(get_appname_from_html(i[3], x), get_item_name_from_html(x), int(i[3]), int(i[2]))
+		else:
+			push_text('"' + url + '" doesn\'t look like a valid workshop item...\n')
+
 def decoded_download_urls(urls: list[str]):
 	if not urls:
 		return
 	pending_downloads = []
 	
-	for line in urls:
-		if len(line) > 0:
-			# check for collection
-			try:
-				x = requests.get(line)
-			except Exception as exc:
-				push_text("Could not load workshop page for " + line + "\n")
-				push_text(str(type(exc)) + "\n")
-				push_text(str(exc) + "\n")
+	for url in urls:
+		if len(url) > 0:
+			pending_downloads.extend(get_app_and_item_ids(url))
 			
-			else:
-				if re.search("SubscribeCollectionItem", x.text):
-					# collection
-					dls = re.findall(r"SubscribeCollectionItem[( ']+(\d+)[ ',]+(\d+)'", x.text)
-					for wid, appid in dls:
-						pending_downloads.append((appid, wid))
-				elif re.search("ShowAddToCollection", x.text):
-					# single item
-					wid, appid = re.findall(r"ShowAddToCollection[( ']+(\d+)[ ',]+(\d+)'", x.text)[0]
-					pending_downloads.append((appid, wid))
-				else:
-					push_text('"' + line + '" doesn\'t look like a valid workshop item...\n')
 	return pending_downloads
 
 def get_mods_folder_for_app(appid: int):
@@ -135,8 +187,9 @@ def ensure_steam_cmd():
 		push_text("Completed downloading the steam-cmd binaries")
 	return p
 
-def run_steamcmd(urls):
+def run_steamcmd(items: list[WorkshopItemInfo]):
 	steamcmd_exe = ensure_steam_cmd()
+	items = [i for i in items if i is not None]
 	
 	args = [steamcmd_exe]
 	if login is not None and passw is not None:
@@ -144,8 +197,9 @@ def run_steamcmd(urls):
 	else:
 		args.append('+login anonymous')
 	
-	for appid, wid in urls:
-		args.append(f'+workshop_download_item {appid} {int(wid)}')
+	for i in items:
+		push_text(f"requsting the workshop item '{i.name}' for '{i.appname}'")
+		args.append(f'+workshop_download_item {i.appid} {int(i.itemid)}')
 	args.append("+quit")
 	
 	# call steamcmd
@@ -153,15 +207,24 @@ def run_steamcmd(urls):
 	return subprocess.Popen(args, stdout=subprocess.PIPE, errors='ignore',
 							   creationflags=subprocess.CREATE_NO_WINDOW)
 
+def deploy_downloaded_item(i: WorkshopItemInfo):
+	app_download_output = download_output_folder.joinpath(i.appname)
+	app_download_output.mkdir(exist_ok=True)
+	workshop_download_output = app_download_output.joinpath(i.name)
+	cur = get_steamcmd_content_folder().joinpath(str(i.appid)).joinpath(str(i.itemid))
+	if not cur.exists():
+		return
+	shutil.copytree(cur, workshop_download_output)
+
+def deploy_all(i: list[WorkshopItemInfo | None]):
+	for j in i:
+		if j is None:
+			continue
+		deploy_downloaded_item(j)
 
 def download(urls: list[str]):
 	# don't start multiple steamcmd instances
-	global running
-	global settings_data
-	global steampath
-	global defaultpath
-	global login
-	global passw
+	urls = [i.strip('"') for i in urls]
 	
 	if running:
 		return
@@ -175,28 +238,25 @@ def download(urls: list[str]):
 			push_text(f'Requesting a download with no urls')
 			return
 		push_text(f'Started {len(downloads)} Download(s)')
-		
-
-	running = True
 	
-	process = run_steamcmd(downloads)
-	
-	while True:
-		out = process.stdout.readline()
-		if m := re.search("Redirecting stderr to", out):
-			push_text(out[:m.span()[0]] + "\n")
-			break
-		if re.match("-- type 'quit' to exit --", out):
-			continue
-		push_text(out)
+	with DownloadLock():
+		process = run_steamcmd(downloads)
 		
-		return_code = process.poll()
-		if return_code is not None:
-			# for out in process.stdout.readlines():
-			# 	push_text(out)
-			break
-		
-	running = False
+		while True:
+			out = process.stdout.readline()
+			if m := re.search("Redirecting stderr to", out):
+				push_text(out[:m.span()[0]] + "\n")
+				break
+			if re.match("-- type 'quit' to exit --", out):
+				continue
+			push_text(out)
+			
+			return_code = process.poll()
+			if return_code is not None:
+				# for out in process.stdout.readlines():
+				# 	push_text(out)
+				break
+	deploy_all(downloads)
 
 
 def load_settings():
@@ -260,15 +320,42 @@ def proc_input(line: str):
 	if not b:
 		return
 	
-	b[0] = b[0].strip()
+	command = b[0].strip()
+	is_bare_download_command = False
 	
-	match b[0]:
+	if command[:4] == 'http':
+		if command[4:7] == 's:/' or command[4:7] == '://':
+			is_bare_download_command = True
+	
+	if is_bare_download_command:
+		proc_input('sub ' + ' '.join([f'"{i}"' for i in b]))
+		return
+	
+	
+	
+	b = b[1:]
+	
+	match command:
 		case 'download' | 'sub' | 'subscribe':
-			download(b[1:])
+			download(b)
 		case 'quit' | 'q' | 'exit':
 			quit()
+		case _:
+			push_text(f"Unknown command: '{command}'")
 		
+
+def excute_run_arguments(args: list[str]):
+	subargs = [[]]
+	for i in args:
+		if i == '*':
+			subargs.append([])
+			continue
+		subargs[-1].append(f'"{i}"')
 	
+	for i in subargs:
+		if not i:
+			continue
+		proc_input(' '.join(i))
 
 def main():
 	global settings_data
@@ -294,13 +381,18 @@ def main():
 	# print(f'settings loaded: {settings_data}')
 	
 	push_text(f'Version: {__version__}')
-	push_text(get_credits())
+	header(get_credits(), border_pattren='# --- #', margin=16)
 	
 	for i in preload_errors:
 		push_text(i)
 	
-	while True:
-		proc_input(input('> '))
+	ensure_steam_cmd()
+	
+	if len(sys.argv) >= 2 and sys.argv[1] == '/c':
+		excute_run_arguments(sys.argv[2:])
+	else:
+		while True:
+			proc_input(input('> '))
 	
 
 
